@@ -3,22 +3,28 @@
 رحلة الذكاء الاصطناعي — أكاديمية نمو (نسخة Streamlit)
 - تسجيل اسم الطالبة ورقم الجوال (0500000000)
 - ثلاثة مستويات: أسئلة، تدريب آلة (KNN)، اكتشاف التحيّز
-- حفظ بيانات اللاعبات ونتائجهن في ملف Excel (players.xlsx)
+- حفظ بيانات اللاعبات ونتائجهن في Google Sheets عبر Google Apps Script (بدون Google Cloud)،
+  أو في ملف Excel محلي إذا لم يُضبط APPS_SCRIPT_URL
 - لوحة مشرف محمية بكلمة مرور لتنزيل الملف
 
 التشغيل محليًا:  streamlit run app.py
 """
 import hmac
+import io
+import json
 import math
 import os
 import re
 import threading
+import time
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -26,7 +32,16 @@ from PIL import Image
 
 BASE = Path(__file__).parent
 LOGO = BASE / "logo.jpg"
-DATA_FILE = Path(os.environ.get("PLAYERS_XLSX", BASE / "players.xlsx"))
+# ======================= إعدادات التخزين (عدّليها هنا مباشرة) =======================
+# مسار ملف Excel. اتركيه فارغًا ليُنشأ players.xlsx بجانب app.py.
+# أمثلة:  ويندوز  EXCEL_PATH = r"C:\Users\Alaq\Desktop\players.xlsx"
+#         ماك     EXCEL_PATH = "/Users/alaq/Desktop/players.xlsx"
+EXCEL_PATH = ""
+# True = الحفظ في ملف Excel دائمًا (حتى لو وُجد APPS_SCRIPT_URL في Secrets)
+FORCE_EXCEL = False
+# ===================================================================================
+DATA_FILE = (Path(EXCEL_PATH).expanduser() if EXCEL_PATH
+             else Path(os.environ.get("PLAYERS_XLSX", BASE / "players.xlsx")))
 
 AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "0123456789" * 2)
 
@@ -101,16 +116,59 @@ LEVELS = [
     (3, "المستوى 3: اكتشفي التحيّز ⚖️", "quiz3"),
 ]
 
-# ============================== التخزين في Excel ==============================
+# ============================== التخزين (Apps Script → Google Sheets، أو Excel) ==============================
 HEADERS = ["المعرّف", "تاريخ التسجيل", "الاسم", "رقم الجوال", "درجة المستوى 1",
            "نقاط المستوى 2", "درجة المستوى 3", "مجموع النقاط", "آخر تحديث"]
-LEVEL_COL = {1: "درجة المستوى 1", 2: "نقاط المستوى 2", 3: "درجة المستوى 3"}
+SHEET_NAME = "اللاعبات"
 
 
 @st.cache_resource
 def file_lock() -> threading.Lock:
-    """قفل مشترك بين جلسات المستخدمات حتى لا يتعارض الحفظ المتزامن."""
+    """قفل مشترك بين الجلسات (لوضع Excel المحلي)."""
     return threading.Lock()
+
+
+@st.cache_resource
+def error_log() -> dict:
+    """سجل مشترك لآخر خطأ حفظ، تراه المشرفة في اللوحة الجانبية."""
+    return {"last": None}
+
+
+def _secret(name, default=None):
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+def use_script() -> bool:
+    return (not FORCE_EXCEL) and bool(_secret("APPS_SCRIPT_URL"))
+
+
+def _script_call(action: str, **payload) -> dict:
+    """يرسل طلبًا إلى تطبيق الويب في Apps Script ويعيد الردّ كقاموس."""
+    url = str(_secret("APPS_SCRIPT_URL", "")).strip()
+    if not url:
+        raise RuntimeError("APPS_SCRIPT_URL غير مضاف في Secrets")
+    body = {"action": action, "secret": str(_secret("APPS_SCRIPT_SECRET", "")), **payload}
+    r = requests.post(url, data=json.dumps(body),
+                      headers={"Content-Type": "text/plain;charset=utf-8"}, timeout=25)
+    r.raise_for_status()
+    try:
+        res = r.json()
+    except ValueError:
+        raise RuntimeError(
+            "ردّ غير متوقع من Apps Script. غالبًا النشر ليس بصلاحية «أي شخص (Anyone)» "
+            "أو الرابط ليس رابط /exec. بداية الردّ: " + r.text[:150].replace("\n", " "))
+    if not res.get("ok"):
+        raise RuntimeError("Apps Script: " + str(res.get("error")))
+    return res
+
+
+def _save_script(row: list) -> None:
+    _script_call("upsert", row=["" if v is None else v for v in row])
 
 
 def _open_workbook():
@@ -118,7 +176,7 @@ def _open_workbook():
         return load_workbook(DATA_FILE)
     wb = Workbook()
     ws = wb.active
-    ws.title = "اللاعبات"
+    ws.title = SHEET_NAME
     ws.sheet_view.rightToLeft = True
     ws.append(HEADERS)
     for c in ws[1]:
@@ -130,35 +188,67 @@ def _open_workbook():
     return wb
 
 
-def save_player(pid: str, fields: dict) -> None:
-    """إنشاء صف للاعبة أو تحديثه (حسب المعرّف) ثم الحفظ بشكل آمن."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+def _save_excel(row: list) -> None:
     with file_lock():
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
         wb = _open_workbook()
         ws = wb.active
-        row = next((r for r in range(2, ws.max_row + 1)
-                    if ws.cell(r, 1).value == pid), None)
-        if row is None:
-            ws.append([pid, now, "", "", None, None, None, 0, now])
-            row = ws.max_row
-        for col_name, value in fields.items():
-            cell = ws.cell(row, HEADERS.index(col_name) + 1, value)
-            if col_name == "رقم الجوال":
-                cell.number_format = "@"  # يحفظ الصفر في بداية الرقم
-        ws.cell(row, HEADERS.index("آخر تحديث") + 1, now)
+        r = next((i for i in range(2, ws.max_row + 1) if ws.cell(i, 1).value == row[0]), None)
+        if r is None:
+            ws.append(row)
+            r = ws.max_row
+        else:
+            for c, v in enumerate(row, 1):
+                ws.cell(r, c, v)
+        ws.cell(r, 4).number_format = "@"
         tmp = DATA_FILE.with_suffix(".tmp")
         wb.save(tmp)
         tmp.replace(DATA_FILE)
 
 
-def persist() -> None:
-    s = st.session_state
-    fields = {LEVEL_COL[n]: s.scores[n] for n in (1, 2, 3)}
-    fields["مجموع النقاط"] = total()
+def save_player(row: list) -> None:
+    if not use_script():
+        return _save_excel(row)
     try:
-        save_player(s.pid, fields)
-    except Exception:  # لا نوقف اللعبة إذا فشل الحفظ
-        s.save_error = True
+        _save_script(row)
+    except Exception:
+        time.sleep(1.5)  # إعادة محاولة واحدة (الحفظ آمن للتكرار لأنه تحديث حسب المعرّف)
+        _save_script(row)
+
+
+def build_row() -> list:
+    s = st.session_state
+    return [s.pid, s.created, s.name, s.phone, s.scores[1], s.scores[2], s.scores[3],
+            total(), datetime.now().strftime("%Y-%m-%d %H:%M")]
+
+
+def persist() -> None:
+    """يحفظ السجل الكامل للاعبة؛ لا يوقف اللعبة إذا فشل الحفظ."""
+    s = st.session_state
+    try:
+        save_player(build_row())
+        s.save_error = None
+    except Exception as e:
+        s.save_error = f"{type(e).__name__}: {e}"
+        error_log()["last"] = (datetime.now().strftime("%Y-%m-%d %H:%M") + "\n"
+                               + traceback.format_exc())
+
+
+def show_save_warning() -> None:
+    if st.session_state.save_error:
+        st.warning("تعذّر حفظ نتيجتك الآن، لكن يمكنك متابعة اللعب. أبلغي المشرفة بالمشكلة.")
+
+
+def load_dataframe() -> pd.DataFrame:
+    if use_script():
+        vals = _script_call("list")["rows"]
+        if len(vals) <= 1:
+            return pd.DataFrame(columns=HEADERS)
+        return pd.DataFrame(vals[1:], columns=vals[0])
+    if not DATA_FILE.exists():
+        return pd.DataFrame(columns=HEADERS)
+    with file_lock():
+        return pd.read_excel(DATA_FILE, dtype=str)
 
 
 # ============================== الحالة ==============================
@@ -167,7 +257,7 @@ def init_state():
         "stage": "login", "name": "", "phone": "", "pid": "",
         "scores": {1: None, 2: None, 3: None},
         "qi": 0, "qc": 0, "picked": None,
-        "train": [], "test": None, "save_error": False,
+        "train": [], "test": None, "save_error": None, "created": "",
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -206,7 +296,7 @@ def header_bar():
 def screen_login():
     if LOGO.exists():
         _, mid, _ = st.columns([1, 1, 1])
-        mid.image(str(LOGO), use_container_width=True)
+        mid.image(str(LOGO), width="stretch")
     st.markdown("<h2 style='text-align:center'>مرحبًا بكِ في رحلة الذكاء الاصطناعي 🤖</h2>",
                 unsafe_allow_html=True)
     with st.form("login"):
@@ -229,10 +319,9 @@ def screen_login():
     else:
         s = st.session_state
         s.name, s.phone, s.pid = name, phone, uuid.uuid4().hex[:10]
-        try:
-            save_player(s.pid, {"الاسم": name, "رقم الجوال": phone})
-        except Exception:
-            s.save_error = True
+        s.created = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with st.spinner("جارٍ تجهيز حسابك…"):
+            persist()
         go("home")
 
 
@@ -253,8 +342,7 @@ def screen_home():
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
-    if s.save_error:
-        st.warning("تعذّر حفظ النتيجة في الملف، أبلغي المشرفة.")
+    show_save_warning()
 
 
 def screen_quiz(n: int):
@@ -263,6 +351,7 @@ def screen_quiz(n: int):
     if s.qi >= len(qs):
         st.markdown(f"## 🎉 أحسنتِ يا {s.name}!")
         st.write(f"إجاباتك الصحيحة: **{s.qc} من {len(qs)}**  |  نقاط المستوى: **{s.scores[n]}**")
+        show_save_warning()
         if st.button("العودة للقائمة", type="primary"):
             go("home")
         return
@@ -316,7 +405,7 @@ def draw_chart():
                                               range=["#2e9e5b", "#000000"])),
             tooltip=["الطول", "الاستدارة", "النوع", "الحقيقي", "النتيجة"])
         chart = chart + squares
-    st.altair_chart(chart.properties(height=320), use_container_width=True)
+    st.altair_chart(chart.properties(height=320), width="stretch")
 
 
 def screen_train():
@@ -374,14 +463,10 @@ def screen_train():
         go("home")
 
 
-# ============================== لوحة المشرف ==============================
+# ============================== لوحة المشرفة ==============================
 def admin_password():
-    try:
-        if "ADMIN_PASSWORD" in st.secrets:
-            return str(st.secrets["ADMIN_PASSWORD"])
-    except Exception:
-        pass
-    return os.environ.get("ADMIN_PASSWORD")
+    pw = _secret("ADMIN_PASSWORD")
+    return str(pw) if pw else None
 
 
 def admin_panel():
@@ -395,21 +480,108 @@ def admin_panel():
         if not hmac.compare_digest(entered.encode(), pw.encode()):
             st.error("كلمة المرور غير صحيحة.")
             return
-        if not DATA_FILE.exists():
-            st.info("لا توجد بيانات بعد.")
+
+        st.caption("وضع التخزين: " + ("Google Sheets (Apps Script)" if use_script() else "ملف Excel محلي"))
+        if st.button("🔌 اختبار الاتصال"):
+            try:
+                if use_script():
+                    res = _script_call("ping")
+                    st.success(f"تم الاتصال بالجدول «{res.get('spreadsheet')}» "
+                               f"(ورقة: {res.get('sheet')}، عدد اللاعبات: {res.get('rows')})")
+                    if res.get("url"):
+                        st.markdown(f"[فتح الجدول]({res['url']})")
+                else:
+                    st.success(f"الحفظ في الملف المحلي: {DATA_FILE.name}")
+            except Exception:
+                st.error("فشل الاتصال. هذا هو الخطأ الحقيقي:")
+                st.code(traceback.format_exc())
+
+        last = error_log()["last"]
+        if last:
+            st.warning("آخر خطأ حدث أثناء الحفظ:")
+            st.code(last)
+
+        try:
+            df = load_dataframe()
+        except Exception:
+            st.error("تعذّرت قراءة البيانات:")
+            st.code(traceback.format_exc())
             return
-        with file_lock():
-            data = DATA_FILE.read_bytes()
-        st.download_button("⬇️ تنزيل ملف اللاعبات (Excel)", data, file_name="players.xlsx",
+        st.metric("عدد اللاعبات", len(df))
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False)
+        st.download_button("⬇️ تنزيل البيانات (Excel)", buf.getvalue(), file_name="players.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.dataframe(pd.read_excel(DATA_FILE, dtype={"رقم الجوال": str}),
-                     use_container_width=True)
+        st.dataframe(df, width="stretch")
 
 
 # ============================== التشغيل ==============================
+APP_VERSION = "2026-10-07-appsscript-v3"
+
+
+def secrets_status() -> str:
+    """حالة قراءة ملف Secrets (أسماء المفاتيح فقط، بدون قيم) لكشف أخطاء التنسيق."""
+    try:
+        return "ok, keys: " + (", ".join(sorted(st.secrets.keys())) or "(none)")
+    except Exception as e:
+        return f"ERROR {type(e).__name__}: {str(e)[:160]}"
+
+
+def storage_warning():
+    """على استضافة Streamlit Cloud بدون APPS_SCRIPT_URL: تنبيه ظاهر بدل فقدان البيانات بصمت."""
+    on_cloud = BASE.as_posix().startswith("/mount/src") or os.environ.get("SHOW_STORAGE_WARNING")
+    if on_cloud and FORCE_EXCEL:
+        st.warning("ℹ️ الحفظ في ملف Excel على خادم Streamlit Cloud مؤقت: يُمسح عند إعادة التشغيل. "
+                   "نزّلي الملف من «لوحة المشرفة» بانتظام.")
+    elif on_cloud and not use_script():
+        st.error("⚠️ إعداد الحفظ غير مكتمل: التطبيق لا يقرأ APPS_SCRIPT_URL من Secrets، "
+                 "لذلك لن تُحفظ البيانات بشكل دائم. افتحي الرابط مع ‎?debug=1‎ لمعرفة السبب.")
+
+
+def debug_footer():
+    """صفحة تشخيص تظهر فقط عند فتح التطبيق بـ ?debug=1 ولا تعرض أي قيمة سرية."""
+    try:
+        if st.query_params.get("debug") != "1":
+            return
+    except Exception:
+        return
+    url = str(_secret("APPS_SCRIPT_URL", "") or "")
+    sec = str(_secret("APPS_SCRIPT_SECRET", "") or "")
+    st.divider()
+    st.caption("🛠️ معلومات التشخيص (لا تحتوي أسرارًا)")
+    st.code("\n".join([
+        f"version: {APP_VERSION}",
+        f"secrets_file: {secrets_status()}",
+        f"storage: {'apps_script' if use_script() else 'local_excel (' + ('FORCE_EXCEL=True' if FORCE_EXCEL else 'APPS_SCRIPT_URL غير مقروء') + ')'}",
+        f"excel_path: {DATA_FILE}",
+        "APPS_SCRIPT_URL: " + (f"set ({url[:34]}...{url[-6:]})" if url else "MISSING"),
+        f"url_ends_with_/exec: {url.endswith('/exec')}",
+        f"url_has_spaces_or_quotes: {any(c in url for c in ' \"“”' + chr(10))}",
+        "APPS_SCRIPT_SECRET: " + (f"set, length {len(sec)}" if sec else "MISSING"),
+        f"ADMIN_PASSWORD: {'set' if admin_password() else 'MISSING'}",
+    ]))
+    if st.button("🔎 فحص الاتصال بالسكربت من الخادم"):
+        if not url:
+            st.error("APPS_SCRIPT_URL غير موجود في Secrets.")
+            return
+        try:
+            g = requests.get(url, timeout=20)
+            st.write(f"فحص الرابط (GET): الحالة {g.status_code}، بداية الردّ:")
+            st.code(g.text[:120])
+        except Exception as e:
+            st.error(f"تعذّر الوصول إلى الرابط من الخادم: {type(e).__name__}: {e}")
+            return
+        try:
+            _script_call("ping")
+            st.success("✅ الرابط وكلمة السر سليمان، والسكربت مرتبط بالجدول.")
+        except Exception as e:
+            st.error(f"❌ {e}")
+
+
 def main():
     init_state()
     admin_panel()
+    storage_warning()
     stage = st.session_state.stage
     if stage != "login":
         header_bar()
@@ -423,6 +595,7 @@ def main():
         screen_quiz(3)
     elif stage == "train":
         screen_train()
+    debug_footer()
 
 
 main()
