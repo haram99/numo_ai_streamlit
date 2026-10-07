@@ -506,6 +506,47 @@ def admin_panel():
 
 
 # ============================== التشغيل ==============================
+APP_VERSION = "2026-10-07-appsscript-v2"
+
+
+def debug_footer():
+    """صفحة تشخيص تظهر فقط عند فتح التطبيق بـ ?debug=1 ولا تعرض أي قيمة سرية."""
+    try:
+        if st.query_params.get("debug") != "1":
+            return
+    except Exception:
+        return
+    url = str(_secret("APPS_SCRIPT_URL", "") or "")
+    sec = str(_secret("APPS_SCRIPT_SECRET", "") or "")
+    st.divider()
+    st.caption("🛠️ معلومات التشخيص (لا تحتوي أسرارًا)")
+    st.code("\n".join([
+        f"version: {APP_VERSION}",
+        f"storage: {'apps_script' if use_script() else 'local_excel (APPS_SCRIPT_URL غير مقروء)'}",
+        "APPS_SCRIPT_URL: " + (f"set ({url[:34]}...{url[-6:]})" if url else "MISSING"),
+        f"url_ends_with_/exec: {url.endswith('/exec')}",
+        f"url_has_spaces_or_quotes: {any(c in url for c in ' \"“”' + chr(10))}",
+        "APPS_SCRIPT_SECRET: " + (f"set, length {len(sec)}" if sec else "MISSING"),
+        f"ADMIN_PASSWORD: {'set' if admin_password() else 'MISSING'}",
+    ]))
+    if st.button("🔎 فحص الاتصال بالسكربت من الخادم"):
+        if not url:
+            st.error("APPS_SCRIPT_URL غير موجود في Secrets.")
+            return
+        try:
+            g = requests.get(url, timeout=20)
+            st.write(f"فحص الرابط (GET): الحالة {g.status_code}، بداية الردّ:")
+            st.code(g.text[:120])
+        except Exception as e:
+            st.error(f"تعذّر الوصول إلى الرابط من الخادم: {type(e).__name__}: {e}")
+            return
+        try:
+            _script_call("ping")
+            st.success("✅ الرابط وكلمة السر سليمان، والسكربت مرتبط بالجدول.")
+        except Exception as e:
+            st.error(f"❌ {e}")
+
+
 def main():
     init_state()
     admin_panel()
@@ -522,6 +563,7 @@ def main():
         screen_quiz(3)
     elif stage == "train":
         screen_train()
+    debug_footer()
 
 
 main()
